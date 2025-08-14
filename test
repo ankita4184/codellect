@@ -1,0 +1,81 @@
+import pdfplumber
+from PIL import Image
+from io import BytesIO
+import fitz  # PyMuPDF
+import os
+
+def find_signatures_and_generate_images(textract_output, pdf_path, output_dir="output"):
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Parse lines with page number and bounding box
+    lines = []
+    page_map = {}
+    
+    for block in textract_output.get("Blocks", []):
+        if block["BlockType"] == "PAGE":
+            page_map[block["Id"]] = block["Page"]
+        if block["BlockType"] == "LINE":
+            text = block.get("Text", "")
+            page_number = block.get("Page")
+            bbox = block.get("Geometry", {}).get("BoundingBox", {})
+            lines.append({
+                "text": text,
+                "page": page_number,
+                "bbox": bbox
+            })
+
+    # Find pages with both "Yours Faithfully" and "Accepted by"
+    yours_pages = {line["page"]: line for line in lines if "yours faithfully" in line["text"].lower()}
+    accepted_pages = {line["page"]: line for line in lines if "accepted by" in line["text"].lower()}
+
+    # Find intersection
+    common_pages = set(yours_pages.keys()) & set(accepted_pages.keys())
+    if not common_pages:
+        print("No page found containing both 'Yours Faithfully' and 'Accepted by'")
+        return
+
+    target_page = sorted(common_pages)[0]
+    print(f"Target page: {target_page}")
+
+    # Extract full page and save as PDF
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[target_page - 1]  # zero-indexed
+
+        # Save page as image and then to PDF
+        im = page.to_image(resolution=300)
+        page_image_path = os.path.join(output_dir, f"page_{target_page}.pdf")
+        im.save(page_image_path, format="PDF")
+
+        # Get coordinates in pixels
+        page_width, page_height = page.width, page.height
+
+        # Extract areas around the two lines
+        def crop_signature_area(line_info, label):
+            bbox = line_info["bbox"]
+            left = bbox["Left"] * page_width
+            top = bbox["Top"] * page_height
+            width = bbox["Width"] * page_width
+            height = bbox["Height"] * page_height
+
+            # Crop 100px below line assuming signature is there
+            crop_top = top + height
+            crop_bottom = crop_top + 100  # adjust based on expected size
+            crop_box = (
+                int(left - 20),  # padding
+                int(crop_top),
+                int(left + width + 20),
+                int(crop_bottom)
+            )
+
+            cropped = page.crop(bbox=(crop_box[0], crop_box[1], crop_box[2], crop_box[3]))
+            cropped_im = cropped.to_image(resolution=300)
+            cropped_path = os.path.join(output_dir, f"{label}_signature_page_{target_page}.png")
+            cropped_im.save(cropped_path)
+            return cropped_path
+
+        yours_path = crop_signature_area(yours_pages[target_page], "yours_faithfully")
+        accepted_path = crop_signature_area(accepted_pages[target_page], "accepted_by")
+
+        print(f"Saved full page to {page_image_path}")
+        print(f"Saved 'Yours Faithfully' signature to {yours_path}")
+        print(f"Saved 'Accepted by' signature to {accepted_path}")
